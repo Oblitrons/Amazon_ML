@@ -84,6 +84,9 @@ DUCKDB_THREADS = 4
 
 def create_connection():
 
+    TEMP_DIR = ROOT_DIR / ".tmp"
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
     con = duckdb.connect()
 
     con.execute(
@@ -92,6 +95,10 @@ def create_connection():
 
     con.execute(
         f"SET threads={DUCKDB_THREADS}"
+    )
+
+    con.execute(
+        f"SET temp_directory='{TEMP_DIR.as_posix()}'"
     )
 
     con.execute(
@@ -785,5 +792,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
