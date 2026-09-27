@@ -1,10 +1,9 @@
-from pathlib import Path
+﻿from pathlib import Path
 import argparse
 import duckdb
 
 
 ROOT = Path(__file__).resolve().parents[2]
-
 DEFAULT_SOURCE_DIR = ROOT / "data" / "cleaned_data"
 DEFAULT_OUTPUT = ROOT / "output" / "pair_features.parquet"
 
@@ -18,14 +17,19 @@ def main():
         "--candidates",
         type=Path,
         required=True,
-        help="Path to candidate_pairs_v3_fuzzy_name.parquet",
+        help="Candidate pairs parquet."
     )
 
     parser.add_argument(
         "--source-dir",
         type=Path,
-        default=DEFAULT_SOURCE_DIR,
+        default=None,
+        help="Directory containing train_source1/2/3.parquet."
     )
+
+    parser.add_argument("--source1", type=Path)
+    parser.add_argument("--source2", type=Path)
+    parser.add_argument("--source3", type=Path)
 
     parser.add_argument(
         "--output",
@@ -36,26 +40,34 @@ def main():
     args = parser.parse_args()
 
     args.candidates = args.candidates.resolve()
-    args.source_dir = args.source_dir.resolve()
     args.output = args.output.resolve()
+
+    if args.source1 and args.source2 and args.source3:
+        source1 = args.source1.resolve()
+        source2 = args.source2.resolve()
+        source3 = args.source3.resolve()
+    else:
+        source_dir = (
+            args.source_dir.resolve()
+            if args.source_dir
+            else DEFAULT_SOURCE_DIR.resolve()
+        )
+
+        source1 = source_dir / "train_source1.parquet"
+        source2 = source_dir / "train_source2.parquet"
+        source3 = source_dir / "train_source3.parquet"
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print("MEMBER 3 - PAIR FEATURE GENERATION")
+    print("PAIR FEATURE GENERATION")
     print("=" * 70)
 
     print(f"\nCandidates: {args.candidates}")
-    print(f"Sources:    {args.source_dir}")
+    print(f"Source 1:   {source1}")
+    print(f"Source 2:   {source2}")
+    print(f"Source 3:   {source3}")
     print(f"Output:     {args.output}")
-
-    # ------------------------------------------------------------
-    # Validate source files
-    # ------------------------------------------------------------
-
-    source1 = args.source_dir / "train_source1.parquet"
-    source2 = args.source_dir / "train_source2.parquet"
-    source3 = args.source_dir / "train_source3.parquet"
 
     if not args.candidates.exists():
         raise FileNotFoundError(
@@ -84,8 +96,8 @@ def main():
         f"""
         CREATE OR REPLACE VIEW candidates AS
         SELECT
-            source1_entity_id,
-            candidate_entity_id
+            CAST(source1_entity_id AS VARCHAR) AS source1_entity_id,
+            CAST(candidate_entity_id AS VARCHAR) AS candidate_entity_id
         FROM read_parquet('{args.candidates.as_posix()}')
         """
     )
@@ -105,11 +117,26 @@ def main():
 
     print("\nCreating source1 view...")
 
+    def source_relation(path):
+        p = path.as_posix()
+
+        if path.suffix.lower() == ".parquet":
+            return f"read_parquet('{p}')"
+
+        return f"""
+            read_csv_auto(
+                '{p}',
+                delim='\\t',
+                header=true,
+                ignore_errors=false
+            )
+        """
+
     con.execute(
         f"""
         CREATE OR REPLACE VIEW source1 AS
         SELECT *
-        FROM read_parquet('{source1.as_posix()}')
+        FROM {source_relation(source1)}
         """
     )
 
@@ -124,39 +151,37 @@ def main():
         CREATE OR REPLACE VIEW candidates_source AS
 
         SELECT
-            entity_id,
-            clean_name,
-            clean_address,
-            clean_country
-        FROM read_parquet('{source2.as_posix()}')
+            CAST(entity_id AS VARCHAR) AS entity_id,
+            CAST(clean_name AS VARCHAR) AS clean_name,
+            CAST(clean_address AS VARCHAR) AS clean_address,
+            CAST(clean_country AS VARCHAR) AS clean_country
+        FROM {source_relation(source2)}
 
         UNION ALL
 
         SELECT
-            entity_id,
-            clean_name,
-            clean_address,
-            clean_country
-        FROM read_parquet('{source3.as_posix()}')
+            CAST(entity_id AS VARCHAR) AS entity_id,
+            CAST(clean_name AS VARCHAR) AS clean_name,
+            CAST(clean_address AS VARCHAR) AS clean_address,
+            CAST(clean_country AS VARCHAR) AS clean_country
+        FROM {source_relation(source3)}
         """
     )
 
     # ------------------------------------------------------------
-    # Inspect schemas
+    # Normalize Source 1 column names
     # ------------------------------------------------------------
 
-    print("\nSource 1 columns:")
-    print(
-        con.execute("DESCRIBE source1")
-        .fetchdf()
-        .to_string(index=False)
-    )
-
-    print("\nCandidate source columns:")
-    print(
-        con.execute("DESCRIBE candidates_source")
-        .fetchdf()
-        .to_string(index=False)
+    con.execute(
+        f"""
+        CREATE OR REPLACE VIEW source1_clean AS
+        SELECT
+            CAST(entity_id AS VARCHAR) AS entity_id,
+            CAST(clean_name AS VARCHAR) AS clean_name,
+            CAST(clean_address AS VARCHAR) AS clean_address,
+            CAST(clean_country AS VARCHAR) AS clean_country
+        FROM {source_relation(source1)}
+        """
     )
 
     # ------------------------------------------------------------
@@ -183,7 +208,7 @@ def main():
 
         FROM candidates c
 
-        INNER JOIN source1 s1
+        INNER JOIN source1_clean s1
             ON c.source1_entity_id = s1.entity_id
 
         INNER JOIN candidates_source s2
@@ -201,7 +226,7 @@ def main():
     print(f"Successfully joined pairs: {joined_count:,}")
 
     # ------------------------------------------------------------
-    # Basic deterministic features
+    # Deterministic features
     # ------------------------------------------------------------
 
     print("\nGenerating deterministic features...")
@@ -214,10 +239,6 @@ def main():
 
             source1_entity_id,
             candidate_entity_id,
-
-            -- -------------------------------------------------
-            -- Exact equality
-            -- -------------------------------------------------
 
             CAST(
                 LOWER(TRIM(COALESCE(name1, ''))) =
@@ -236,10 +257,6 @@ def main():
                 LOWER(TRIM(COALESCE(country2, '')))
                 AS INTEGER
             ) AS country_exact,
-
-            -- -------------------------------------------------
-            -- Missingness
-            -- -------------------------------------------------
 
             CAST(
                 name1 IS NULL OR TRIM(name1) = ''
@@ -261,10 +278,6 @@ def main():
                 AS INTEGER
             ) AS address2_missing,
 
-            -- -------------------------------------------------
-            -- Length features
-            -- -------------------------------------------------
-
             LENGTH(COALESCE(name1, '')) AS name1_length,
             LENGTH(COALESCE(name2, '')) AS name2_length,
 
@@ -280,10 +293,6 @@ def main():
                 LENGTH(COALESCE(address1, '')) -
                 LENGTH(COALESCE(address2, ''))
             ) AS address_length_diff,
-
-            -- -------------------------------------------------
-            -- Raw text retained for fuzzy feature stage
-            -- -------------------------------------------------
 
             name1,
             name2,
@@ -327,3 +336,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
